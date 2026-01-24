@@ -1,0 +1,87 @@
+---
+###########################
+###########################
+## Test GitHub Actions   ##
+###########################
+###########################
+name: Run Pester Tests
+
+#
+# Documentation:
+# https://help.github.com/en/articles/workflow-syntax-for-github-actions
+#
+
+#############################
+# Start the job on all push #
+#############################
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+###############
+# Set the Job #
+###############
+jobs:
+  test:
+    # Name the Job
+    name: Run Pester Tests
+    # Set the agent to run on - use latest Windows runner
+    runs-on: windows-latest
+
+    ##################
+    # Load all steps #
+    ##################
+    steps:
+      ##########################
+      # Checkout the code base #
+      ##########################
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      ################################
+      # Install Pester module        #
+      ################################
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Install-Module -Name Pester -RequiredVersion 5.6.1 -Force -SkipPublisherCheck
+
+      ################################
+      # Run Pester tests             #
+      ################################
+      - name: Run Pester Tests
+        shell: pwsh
+        run: |
+          $config = New-PesterConfiguration
+          $config.Run.Path = './Tests'
+          $config.Run.Exit = $true
+          $config.TestResult.Enabled = $true
+          $config.TestResult.OutputPath = 'test-results.xml'
+          $config.TestResult.OutputFormat = 'NUnitXml'
+          $config.Output.Verbosity = 'Detailed'
+          
+          Invoke-Pester -Configuration $config
+
+      ################################
+      # Upload test results          #
+      ################################
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+          retention-days: 30
+
+      ################################
+      # Publish Test Results         #
+      ################################
+      - name: Publish Test Results
+        uses: EnricoMi/publish-unit-test-result-action/windows@v2
+        if: always()
+        with:
+          files: test-results.xml
+          check_name: 'Pester Test Results'
