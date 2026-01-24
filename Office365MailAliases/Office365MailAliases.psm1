@@ -282,7 +282,7 @@ Function Get-UsedMailAlias {
     param(
         [parameter(Mandatory = $false, HelpMessage = "Name prefix that is used to identify the Mail Aliases")]
         [ValidateNotNullOrEmpty()]
-        [ValidatePattern('^[a-zA-Z0-9]{1,10}$')]
+        [ValidatePattern('^[a-zA-Z0-9\*]{1,10}$')]
         [string]$GroupNamePrefix = '*',
 
         [parameter(Mandatory = $false, HelpMessage = "Create a draft mail in the mailbox of the user that contains all the used mail aliases")]
@@ -350,7 +350,7 @@ Function Get-UnusedMailAlias {
     param(
         [parameter(Mandatory = $false, HelpMessage = "Name prefix that is used to identify the Mail Aliases")]
         [ValidateNotNullOrEmpty()]
-        [ValidatePattern('^[a-zA-Z0-9]{1,10}$')]
+        [ValidatePattern('^[a-zA-Z0-9\*]{1,10}$')]
         [string]$GroupNamePrefix = '*',
 
         [parameter(Mandatory = $false, HelpMessage = "Keep the Exchange Online session alive for further use")]
@@ -439,10 +439,17 @@ Function Set-MailAliasToArchived {
         Set-DistributionGroup -Identity $ExistingDistributionGroup.Identity -DisplayName "(Archived) $($ExistingDistributionGroup.DisplayName)" -ErrorAction Stop
 
         Write-Output "Removing members from distribution group"
-        Get-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                Remove-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -Member $_.Identity -Confirm:$false -ErrorAction Stop
+        $members = Get-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -ErrorAction SilentlyContinue
+        if ($members) {
+            foreach ($member in $members) {
+                try {
+                    Remove-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -Member $member.Identity -Confirm:$false -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Failed to remove member $($member.Identity): $_"
+                }
             }
+        }
 
         # Return the new name of the alias
         Write-Output "Done, new result:"
