@@ -30,84 +30,133 @@
 
 Function New-MailAlias {
     #Requires -Modules ExchangeOnlineManagement
+    [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '*', Scope = 'Function', Target = '*', Justification = 'Does not change system state')]
     param(
         [parameter(Mandatory = $true, HelpMessage = "Specify the amount of aliases required")]
-        [ValidateNotNullOrEmpty()]
+        [ValidateRange(1, 100)]
         [int]$NumberOfAliases,
 
         [parameter(Mandatory = $true, HelpMessage = "Specify the domain name that is used for the email address. E.g. johndoe.com")]
         [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$')]
         [string]$EmailDomain,
 
         [parameter(Mandatory = $true, HelpMessage = "Specify the owner of the alias. E.g. john@johndoe.com")]
         [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')]
         [string]$Owner,
 
         [parameter(Mandatory = $true, HelpMessage = "Specify the prefix that will be used to create the alias. E.g. JD")]
         [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[a-zA-Z0-9]{1,10}$')]
         [string]$GroupNamePrefix,
 
         [parameter(Mandatory = $false, HelpMessage = "Keep the Exchange Online session alive for further use")]
         [switch]$KeepAlive
     )
 
-    ## Login to Office 365
-    If (!(Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" })) {
-        Connect-ExchangeOnline -ShowBanner:$false
+    ## Connect to Exchange Online if not already connected
+    # Modern session detection using Get-ConnectionInformation (ExchangeOnlineManagement v2.0+)
+    try {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $connectionInfo -or $connectionInfo.State -ne 'Connected') {
+            Write-Verbose "Connecting to Exchange Online..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        else {
+            Write-Verbose "Using existing Exchange Online connection"
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange Online: $_"
+        throw
     }
 
     Write-Verbose "Creating $NumberOfAliases aliases"
 
-    Foreach ($i in 1..$NumberOfAliases) {
-        $Random = Get-Random -Minimum 10000 -Maximum 99999
-        $GroupName = $GroupNamePrefix + $Random
-        $GroupEmail = ($GroupName + "@" + $EmailDomain)
+    $createdAliases = 0
+    $maxRetries = 3
 
-        Write-Verbose "Creating alias $i with name $GroupName"
+    foreach ($i in 1..$NumberOfAliases) {
+        $retryCount = 0
+        $aliasCreated = $false
 
-        If (Get-DistributionGroup | Where-Object { $_.Name -like "*$GroupName*" }) {
-            Write-Verbose "Distribution Group name is not unique. Will skip name $GroupName"
+        while (-not $aliasCreated -and $retryCount -lt $maxRetries) {
+            $Random = Get-Random -Minimum 10000 -Maximum 99999
+            $GroupName = $GroupNamePrefix + $Random
+            $GroupEmail = ($GroupName + "@" + $EmailDomain)
+
+            Write-Verbose "Creating alias $i with name $GroupName (attempt $($retryCount + 1))"
+
+            # Check if group name already exists
+            $existingGroup = Get-DistributionGroup -Filter "Name -like '*$GroupName*'" -ErrorAction SilentlyContinue
+
+            if ($existingGroup) {
+                Write-Verbose "Distribution Group name is not unique. Will skip name $GroupName"
+                $retryCount++
+                continue
+            }
+
+            # Create the new Distribution Group
+            try {
+                New-DistributionGroup -Name $GroupName -Type "Security" -ManagedBy $Owner -PrimarySmtpAddress $GroupEmail -ErrorAction Stop | Out-Null
+
+                # SECURITY WARNING: This allows external (unauthenticated) senders to mail to the address
+                # This is required for the alias functionality but creates potential spam/phishing risk
+                # Consider implementing additional security measures such as mail flow rules or spam filtering
+                Set-DistributionGroup -Identity $GroupName -RequireSenderAuthenticationEnabled:$false -DisplayName $($GroupName + "_CLAIMABLE") -ErrorAction Stop
+
+                # Modify the new Distribution Group with SendOnBehalf permissions
+                Add-RecipientPermission -Identity $GroupName -AccessRights SendAs -Trustee $Owner -Confirm:$false -ErrorAction Stop | Out-Null
+
+                # Add the owner to the Distribution Group
+                Add-DistributionGroupMember -Identity $GroupName -Member $Owner -ErrorAction Stop
+
+                Write-Verbose "Created group called $GroupName with owner $Owner"
+                $aliasCreated = $true
+                $createdAliases++
+            }
+            catch [System.Management.Automation.RemoteException] {
+                if ($_.Exception.Message -match "already exists") {
+                    Write-Verbose "Distribution Group already exists. Retrying with new name..."
+                    $retryCount++
+                }
+                else {
+                    Write-Error "Failed to create Distribution Group '$GroupName': $_"
+                    break
+                }
+            }
+            catch {
+                Write-Error "Unexpected error creating Distribution Group '$GroupName': $_"
+                break
+            }
         }
 
-        Else {
-            # Create the new Distribution Group
-            Try {
-                New-DistributionGroup -Name $GroupName -Type "Security" -ManagedBy $Owner -PrimarySmtpAddress $GroupEmail
-            }
-
-            Catch [Exception] {
-                Write-Error "Distribution Group already exists or another error occurred"
-                Break
-            }
-
-            # Allow external senders to mail to the address & set _CLAIMABLE suffix
-            Set-DistributionGroup -Identity $GroupName -RequireSenderAuthenticationEnabled:$false -DisplayName $($GroupName + "_CLAIMABLE")
-
-            # Modify the new Distribution Group with SendOnBehalf permissions
-            Add-RecipientPermission -Identity $GroupName -AccessRights SendAs -Trustee $Owner -Confirm:$false
-
-            # Add the owner to the Distribution Group
-            Add-DistributionGroupMember -Identity $GroupName -Member $Owner
-
-            Write-Verbose "Created group called $GroupName with owner $Owner"
+        if (-not $aliasCreated) {
+            Write-Warning "Failed to create alias $i after $maxRetries attempts"
         }
     }
 
+    Write-Verbose "Successfully created $createdAliases out of $NumberOfAliases requested aliases"
+
     # Disconnect the session to make sure we don't run out of maximum concurrent connections
-    If (!$KeepAlive) {
-        If (Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" }) {
-            $Null = Disconnect-ExchangeOnline -Confirm:$false
+    if (-not $KeepAlive) {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
+            Write-Verbose "Disconnecting from Exchange Online"
+            Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         }
     }
 }
 
 Function Select-MailAlias {
     #Requires -Modules ExchangeOnlineManagement
-
+    [CmdletBinding()]
     param(
         [parameter(Mandatory = $true, HelpMessage = "Specify the domain name of the website")]
         [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,253}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,253}[a-zA-Z0-9])?)*$')]
         [string]$DomainName,
 
         [parameter(Mandatory = $false, HelpMessage = "Create a draft mail in the mailbox of the user that contains all the used mail aliases")]
@@ -117,17 +166,28 @@ Function Select-MailAlias {
         [switch]$KeepAlive
     )
 
-    ## Login to Office 365
-    If (!(Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" })) {
-        Connect-ExchangeOnline -ShowBanner:$false
+    ## Connect to Exchange Online if not already connected
+    try {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $connectionInfo -or $connectionInfo.State -ne 'Connected') {
+            Write-Verbose "Connecting to Exchange Online..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        else {
+            Write-Verbose "Using existing Exchange Online connection"
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange Online: $_"
+        throw
     }
 
     Write-Verbose "Claiming an alias for $DomainName"
 
     # Check if domain name already exists in Distribution Group
-    $ExistingDistributionGroup = Get-DistributionGroup | Where-Object { $_.DisplayName -like "$DomainName - *" }
+    $ExistingDistributionGroup = Get-DistributionGroup -Filter "DisplayName -like '$DomainName - *'" -ErrorAction SilentlyContinue
 
-    If ($ExistingDistributionGroup) {
+    if ($ExistingDistributionGroup) {
         Write-Output "Alias for domain name '$($DomainName)' already exists. Returning the alias already in use"
 
         $DistributionGroup = $ExistingDistributionGroup
@@ -135,29 +195,39 @@ Function Select-MailAlias {
         $EmailDomain = $DistributionGroup.PrimarySmtpAddress.Split('@')[1]
         $DisplayName = $DomainName + " - " + $EmailDomain
     }
-
-    Else {
+    else {
         # Search for unused alias and return the oldest one
-        $ClaimableDistributionGroups = Get-DistributionGroup | Where-Object { $_.DisplayName -Like "*_CLAIMABLE" } | Sort-Object WhenCreatedUtc
+        $ClaimableDistributionGroups = Get-DistributionGroup -Filter "DisplayName -like '*_CLAIMABLE'" -ErrorAction SilentlyContinue |
+            Sort-Object WhenCreatedUtc
 
-        If (!($ClaimableDistributionGroups)) {
+        if (-not $ClaimableDistributionGroups) {
             Write-Error "No claimable Mail Aliases found. Please run New-MailAlias first."
-            Break
+            throw "No claimable aliases available"
         }
 
-        While (!($ClaimableDistributionGroups = Get-DistributionGroup | Where-Object { $_.DisplayName -Like "*_CLAIMABLE" })) {
+        # Implement timeout for waiting on new aliases
+        $maxWaitSeconds = 60
+        $waitCount = 0
+        while (-not $ClaimableDistributionGroups -and $waitCount -lt ($maxWaitSeconds / 5)) {
             Write-Output "Waiting for a new claimable Distribution Group. Pause 5 seconds..."
             Start-Sleep -Seconds 5
+            $waitCount++
+            $ClaimableDistributionGroups = Get-DistributionGroup -Filter "DisplayName -like '*_CLAIMABLE'" -ErrorAction SilentlyContinue
         }
 
-        Write-Verbose "Found $($ClaimableDistributionGroups.GetType().Count) claimable Distribution Group(s)"
+        if (-not $ClaimableDistributionGroups) {
+            Write-Error "Timeout waiting for claimable Distribution Groups after $maxWaitSeconds seconds"
+            throw "No claimable aliases became available"
+        }
+
+        Write-Verbose "Found $(@($ClaimableDistributionGroups).Count) claimable Distribution Group(s)"
 
         # Rename unused alias & change description
         $DistributionGroup = $ClaimableDistributionGroups[0]
 
-        Write-Verbose "Picking $DistributionGroup for the rename"
+        Write-Verbose "Picking $($DistributionGroup.Name) for the rename"
 
-        If ($DistributionGroup.WhenCreated.AddHours(1) -gt (Get-Date)) {
+        if ($DistributionGroup.WhenCreated.AddHours(1) -gt (Get-Date)) {
             Write-Warning "Be aware that this alias is <60 minutes old and might not be active yet"
         }
 
@@ -165,41 +235,55 @@ Function Select-MailAlias {
         $EmailDomain = $DistributionGroup.PrimarySmtpAddress.Split('@')[1]
         $DisplayName = $DomainName + " - " + $EmailDomain
 
-        Set-DistributionGroup -Identity $DistributionGroup.Name -DisplayName $DisplayName
+        try {
+            Set-DistributionGroup -Identity $DistributionGroup.Name -DisplayName $DisplayName -ErrorAction Stop
+        }
+        catch {
+            Write-Error "Failed to update Distribution Group '$($DistributionGroup.Name)': $_"
+            throw
+        }
     }
 
     # Create the draft mail in the mailbox of the user that contains all the used mail aliases
-    If ($ExportAliasesToMailDraft) {
-        $MailMessage = New-MailMessage -Body (Get-UsedMailAlias | Select-Object Name, DisplayName | Sort-Object DisplayName | Out-String) -Subject "Used Mailbox Aliases"
+    if ($ExportAliasesToMailDraft) {
+        try {
+            $usedAliases = Get-UsedMailAlias -KeepAlive
+            $MailMessage = New-MailMessage -Body ($usedAliases | Select-Object Name, DisplayName | Sort-Object DisplayName | Out-String) -Subject "Used Mailbox Aliases" -ErrorAction Stop
 
-        if ($MailMessage) {
-            Write-Output "Successfully created draft mail message with subject '$($MailMessage.Subject)' and object state '$($MailMessage.ObjectState)'"
+            if ($MailMessage) {
+                Write-Output "Successfully created draft mail message with subject '$($MailMessage.Subject)' and object state '$($MailMessage.ObjectState)'"
+            }
         }
-
-        Else {
-            Write-Warning "Something went wrong with creating the draft mail message"
+        catch {
+            Write-Warning "Failed to create draft mail message: $_"
         }
     }
 
     # Disconnect the session to make sure we don't run out of maximum concurrent connections
-    If (!$KeepAlive) {
-        If (Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" }) {
-            $Null = Disconnect-ExchangeOnline -Confirm:$false
+    if (-not $KeepAlive) {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
+            Write-Verbose "Disconnecting from Exchange Online"
+            Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         }
     }
 
     # Return the new name of the alias
-    return New-Object PSObject -Property ([ordered]@{"Name" = $DistributionGroup.Name; "DisplayName" = $DisplayName; "E-mail" = $DistributionGroup.PrimarySmtpAddress })
+    return [PSCustomObject]@{
+        Name        = $DistributionGroup.Name
+        DisplayName = $DisplayName
+        Email       = $DistributionGroup.PrimarySmtpAddress
+    }
 }
 
 Function Get-UsedMailAlias {
     #Requires -Modules ExchangeOnlineManagement
-
+    [CmdletBinding()]
     param(
         [parameter(Mandatory = $false, HelpMessage = "Name prefix that is used to identify the Mail Aliases")]
         [ValidateNotNullOrEmpty()]
-        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '$GroupNamePrefix', Justification = 'False positive')]
-        [string]$GroupNamePrefix,
+        [ValidatePattern('^[a-zA-Z0-9\*]{1,10}$')]
+        [string]$GroupNamePrefix = '*',
 
         [parameter(Mandatory = $false, HelpMessage = "Create a draft mail in the mailbox of the user that contains all the used mail aliases")]
         [switch]$ExportAliasesToMailDraft,
@@ -208,125 +292,182 @@ Function Get-UsedMailAlias {
         [switch]$KeepAlive
     )
 
-    ## Login to Office 365
-    If (!(Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" })) {
-        Connect-ExchangeOnline -ShowBanner:$false
+    ## Connect to Exchange Online if not already connected
+    try {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $connectionInfo -or $connectionInfo.State -ne 'Connected') {
+            Write-Verbose "Connecting to Exchange Online..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        else {
+            Write-Verbose "Using existing Exchange Online connection"
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange Online: $_"
+        throw
     }
 
     # Check if domain name already exists in Distribution Group
-    $ExistingDistributionGroup = Get-DistributionGroup | Where-Object `
-    { $_.Name -like "$GroupNamePrefix*" -and $_.DisplayName -notlike "*_CLAIMABLE" }
+    $filterString = "Name -like '$GroupNamePrefix*' -and DisplayName -notlike '*_CLAIMABLE'"
+    $ExistingDistributionGroup = Get-DistributionGroup -Filter $filterString -ErrorAction SilentlyContinue
 
     # Create the draft mail in the mailbox of the user that contains all the used mail aliases
-    If ($ExistingDistributionGroup -and $ExportAliasesToMailDraft) {
-        $MailMessage = New-MailMessage -Body ($ExistingDistributionGroup | Select-Object Name, DisplayName | Sort-Object DisplayName | Out-String) -Subject "Used Mailbox Aliases"
+    if ($ExistingDistributionGroup -and $ExportAliasesToMailDraft) {
+        try {
+            $MailMessage = New-MailMessage -Body ($ExistingDistributionGroup | Select-Object Name, DisplayName | Sort-Object DisplayName | Out-String) -Subject "Used Mailbox Aliases" -ErrorAction Stop
 
-        if ($MailMessage) {
-            Write-Output "Successfully created draft mail message with subject '$($MailMessage.Subject)' and object state '$($MailMessage.ObjectState)'"
+            if ($MailMessage) {
+                Write-Output "Successfully created draft mail message with subject '$($MailMessage.Subject)' and object state '$($MailMessage.ObjectState)'"
+            }
         }
-
-        Else {
-            Write-Warning "Something went wrong with creating the draft mail message"
+        catch {
+            Write-Warning "Failed to create draft mail message: $_"
         }
     }
 
     # Disconnect the session to make sure we don't run out of maximum concurrent connections
-    If (!$KeepAlive) {
-        If (Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" }) {
-            $Null = Disconnect-ExchangeOnline -Confirm:$false
+    if (-not $KeepAlive) {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
+            Write-Verbose "Disconnecting from Exchange Online"
+            Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         }
     }
 
-    # Return the new name of the alias(es)
-    If ($ExistingDistributionGroup) {
+    # Return the names of the alias(es)
+    if ($ExistingDistributionGroup) {
         return $ExistingDistributionGroup | Select-Object Name, DisplayName, PrimarySmtpAddress | Sort-Object DisplayName
     }
-    Else {
-        return
+    else {
+        return $null
     }
 }
 
 Function Get-UnusedMailAlias {
     #Requires -Modules ExchangeOnlineManagement
-
+    [CmdletBinding()]
     param(
         [parameter(Mandatory = $false, HelpMessage = "Name prefix that is used to identify the Mail Aliases")]
         [ValidateNotNullOrEmpty()]
-        [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSReviewUnusedParameter', '$GroupNamePrefix', Justification = 'False positive')]
-        [string]$GroupNamePrefix,
+        [ValidatePattern('^[a-zA-Z0-9\*]{1,10}$')]
+        [string]$GroupNamePrefix = '*',
 
         [parameter(Mandatory = $false, HelpMessage = "Keep the Exchange Online session alive for further use")]
         [switch]$KeepAlive
     )
 
-    ## Login to Office 365
-    If (!(Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" })) {
-        Connect-ExchangeOnline -ShowBanner:$false
+    ## Connect to Exchange Online if not already connected
+    try {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $connectionInfo -or $connectionInfo.State -ne 'Connected') {
+            Write-Verbose "Connecting to Exchange Online..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        else {
+            Write-Verbose "Using existing Exchange Online connection"
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange Online: $_"
+        throw
     }
 
     # Check if domain name already exists in Distribution Group
-    $ExistingDistributionGroup = Get-DistributionGroup | Where-Object `
-    { $_.Name -like "$GroupNamePrefix*" -and $_.DisplayName -like "*_CLAIMABLE" }
+    $filterString = "Name -like '$GroupNamePrefix*' -and DisplayName -like '*_CLAIMABLE'"
+    $ExistingDistributionGroup = Get-DistributionGroup -Filter $filterString -ErrorAction SilentlyContinue
 
     # Disconnect the session to make sure we don't run out of maximum concurrent connections
-    If (!$KeepAlive) {
-        If (Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" }) {
-            $Null = Disconnect-ExchangeOnline -Confirm:$false
+    if (-not $KeepAlive) {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
+            Write-Verbose "Disconnecting from Exchange Online"
+            Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         }
     }
 
     # Return the names of the unused alias(es)
-    If ($ExistingDistributionGroup) {
+    if ($ExistingDistributionGroup) {
         return $ExistingDistributionGroup | Select-Object Name, DisplayName, PrimarySmtpAddress
     }
-    Else {
-        return
+    else {
+        return $null
     }
 }
 
 Function Set-MailAliasToArchived {
     #Requires -Modules ExchangeOnlineManagement
+    [CmdletBinding()]
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '*', Scope = 'Function', Target = '*', Justification = 'Does not change system state')]
-
     param(
         [parameter(Mandatory = $true, HelpMessage = "Specify the domain name of the website")]
         [ValidateNotNullOrEmpty()]
+        [ValidatePattern('^[a-zA-Z0-9]([a-zA-Z0-9-]{0,253}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,253}[a-zA-Z0-9])?)*$')]
         [string]$DomainName,
 
         [parameter(Mandatory = $false, HelpMessage = "Keep the Exchange Online session alive for further use")]
         [switch]$KeepAlive
     )
 
-    ## Login to Office 365
-    If (!(Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" })) {
-        Connect-ExchangeOnline -ShowBanner:$false
+    ## Connect to Exchange Online if not already connected
+    try {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if (-not $connectionInfo -or $connectionInfo.State -ne 'Connected') {
+            Write-Verbose "Connecting to Exchange Online..."
+            Connect-ExchangeOnline -ShowBanner:$false -ErrorAction Stop
+        }
+        else {
+            Write-Verbose "Using existing Exchange Online connection"
+        }
+    }
+    catch {
+        Write-Error "Failed to connect to Exchange Online: $_"
+        throw
     }
 
     # Check if domain name already exists in Distribution Group
-    $ExistingDistributionGroup = Get-DistributionGroup | Where-Object `
-    { $_.DisplayName -like "$DomainName - *" }
+    $ExistingDistributionGroup = Get-DistributionGroup -Filter "DisplayName -like '$DomainName - *'" -ErrorAction SilentlyContinue
 
-    if (!$ExistingDistributionGroup) {
-        throw "Cannot find an existing Distribution Group with domain name '$($DomainName)'"
+    if (-not $ExistingDistributionGroup) {
+        $errorMessage = "Cannot find an existing Distribution Group with domain name '$($DomainName)'"
+        Write-Error $errorMessage
+        throw $errorMessage
     }
 
-    else {
+    try {
         Write-Output "Changing displayName from '$($ExistingDistributionGroup.DisplayName)' to '(Archived) $($ExistingDistributionGroup.DisplayName)'"
-        Set-DistributionGroup -Identity $ExistingDistributionGroup.Identity -DisplayName "(Archived) $($ExistingDistributionGroup.DisplayName)"
+        Set-DistributionGroup -Identity $ExistingDistributionGroup.Identity -DisplayName "(Archived) $($ExistingDistributionGroup.DisplayName)" -ErrorAction Stop
 
         Write-Output "Removing members from distribution group"
-        $ExistingDistributionGroup | Remove-DistributionGroupMember -Confirm:$false
+        $members = Get-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -ErrorAction SilentlyContinue
+        if ($members) {
+            foreach ($member in $members) {
+                try {
+                    Remove-DistributionGroupMember -Identity $ExistingDistributionGroup.Identity -Member $member.Identity -Confirm:$false -ErrorAction Stop
+                }
+                catch {
+                    Write-Warning "Failed to remove member $($member.Identity): $_"
+                }
+            }
+        }
 
         # Return the new name of the alias
         Write-Output "Done, new result:"
     }
+    catch {
+        Write-Error "Failed to archive Distribution Group '$($ExistingDistributionGroup.Name)': $_"
+        throw
+    }
 
-    $output = Get-DistributionGroup -Identity $ExistingDistributionGroup.Identity | Select-Object Name, DisplayName, PrimarySmtpAddress
+    $output = Get-DistributionGroup -Identity $ExistingDistributionGroup.Identity -ErrorAction Stop |
+        Select-Object Name, DisplayName, PrimarySmtpAddress
 
     # Disconnect the session to make sure we don't run out of maximum concurrent connections
-    If (!$KeepAlive) {
-        If (Get-PSSession | Where-Object { $_.ComputerName -eq "outlook.office365.com" -and $_.State -eq "Opened" }) {
-            $Null = Disconnect-ExchangeOnline -Confirm:$false
+    if (-not $KeepAlive) {
+        $connectionInfo = Get-ConnectionInformation -ErrorAction SilentlyContinue
+        if ($connectionInfo) {
+            Write-Verbose "Disconnecting from Exchange Online"
+            Disconnect-ExchangeOnline -Confirm:$false | Out-Null
         }
     }
 
