@@ -1,0 +1,7 @@
+# Test artifacts
+Tests/ExchangeOnlineManagement.psm1
+test-results.xml
+TestResults.xml
+
+# Build artifacts
+*.nupkg
