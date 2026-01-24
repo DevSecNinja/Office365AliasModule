@@ -30,6 +30,12 @@ jobs:
     name: Run Pester Tests
     # Set the agent to run on - use latest Windows runner
     runs-on: windows-latest
+    
+    # Set explicit permissions for GITHUB_TOKEN
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
 
     ##################
     # Load all steps #
