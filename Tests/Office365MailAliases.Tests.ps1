@@ -19,11 +19,13 @@ BeforeAll {
 # Stub module to satisfy #requires statements during testing
 function Connect-ExchangeOnline { }
 function Disconnect-ExchangeOnline { }
+function Get-ConnectionInformation { }
 function Get-DistributionGroup { }
 function New-DistributionGroup { }
 function Set-DistributionGroup { }
 function Add-RecipientPermission { }
 function Add-DistributionGroupMember { }
+function Get-DistributionGroupMember { }
 function Remove-DistributionGroupMember { }
 Export-ModuleMember -Function *
 '@
@@ -39,10 +41,14 @@ Export-ModuleMember -Function *
     # Mock Exchange Online cmdlets that are used by the module
     Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
     Mock Disconnect-ExchangeOnline { } -ModuleName Office365MailAliases
+    Mock Get-ConnectionInformation {
+        return $null
+    } -ModuleName Office365MailAliases
     Mock Get-PSSession {
         return @()
     } -ModuleName Office365MailAliases
     Mock Get-DistributionGroup { } -ModuleName Office365MailAliases
+    Mock Get-DistributionGroupMember { } -ModuleName Office365MailAliases
     Mock New-DistributionGroup { } -ModuleName Office365MailAliases
     Mock Set-DistributionGroup { } -ModuleName Office365MailAliases
     Mock Add-RecipientPermission { } -ModuleName Office365MailAliases
@@ -84,12 +90,15 @@ Describe 'New-MailAlias' {
 
     Context 'Typical Usage' {
         BeforeEach {
+            Mock Get-ConnectionInformation {
+                return $null
+            } -ModuleName Office365MailAliases
             Mock Get-PSSession {
                 return @()
             } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                return @()
+                return $null
             } -ModuleName Office365MailAliases
             Mock New-DistributionGroup { } -ModuleName Office365MailAliases
             Mock Set-DistributionGroup { } -ModuleName Office365MailAliases
@@ -111,6 +120,9 @@ Describe 'New-MailAlias' {
         }
 
         It 'Should disconnect from Exchange Online when KeepAlive is not specified' {
+            Mock Get-ConnectionInformation {
+                return [PSCustomObject]@{ State = 'Connected' }
+            } -ModuleName Office365MailAliases
             Mock Get-PSSession {
                 return @([PSCustomObject]@{ ComputerName = 'outlook.office365.com'; State = 'Opened' })
             } -ModuleName Office365MailAliases
@@ -137,6 +149,7 @@ Describe 'New-MailAlias' {
 
     Context 'Edge Cases' {
         It 'Should skip creation when distribution group name already exists' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             # Mock Get-Random to return a specific value
             Mock Get-Random {
                 return 12345
@@ -155,8 +168,9 @@ Describe 'New-MailAlias' {
         }
 
         It 'Should handle New-DistributionGroup exceptions' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                return @()
+                return $null
             } -ModuleName Office365MailAliases
             
             Mock New-DistributionGroup {
@@ -185,15 +199,19 @@ Describe 'Select-MailAlias' {
 
     Context 'Typical Usage - Existing Alias' {
         BeforeEach {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                param($Identity)
-                return @([PSCustomObject]@{
-                    Name = 'TEST12345'
-                    DisplayName = 'Google.com - contoso.com'
-                    PrimarySmtpAddress = 'TEST12345@contoso.com'
-                })
+                param($Filter)
+                if ($Filter -match 'Google.com') {
+                    return @([PSCustomObject]@{
+                        Name = 'TEST12345'
+                        DisplayName = 'Google.com - contoso.com'
+                        PrimarySmtpAddress = 'TEST12345@contoso.com'
+                    })
+                }
+                return $null
             } -ModuleName Office365MailAliases
             Mock Disconnect-ExchangeOnline { } -ModuleName Office365MailAliases
         }
@@ -203,7 +221,7 @@ Describe 'Select-MailAlias' {
 
             $result.Name | Should -Be 'TEST12345'
             $result.DisplayName | Should -Be 'Google.com - contoso.com'
-            $result.'E-mail' | Should -Be 'TEST12345@contoso.com'
+            $result.Email | Should -Be 'TEST12345@contoso.com'
         }
 
         It 'Should not modify existing alias' {
@@ -215,22 +233,26 @@ Describe 'Select-MailAlias' {
 
     Context 'Typical Usage - New Alias' {
         BeforeEach {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                param($Identity)
-                # First call: Check for existing domain alias - returns nothing
-                # Second call: Get claimable aliases
-                if ($null -ne $Identity) {
+                param($Filter)
+                # Check if looking for existing domain alias
+                if ($Filter -match 'NewDomain.com') {
                     return $null
                 }
-                return @([PSCustomObject]@{
-                    Name = 'TEST12345'
-                    DisplayName = 'TEST12345_CLAIMABLE'
-                    PrimarySmtpAddress = 'TEST12345@contoso.com'
-                    WhenCreated = (Get-Date).AddHours(-2)
-                    WhenCreatedUtc = (Get-Date).AddHours(-2)
-                })
+                # Looking for claimable aliases
+                if ($Filter -match '_CLAIMABLE') {
+                    return @([PSCustomObject]@{
+                        Name = 'TEST12345'
+                        DisplayName = 'TEST12345_CLAIMABLE'
+                        PrimarySmtpAddress = 'TEST12345@contoso.com'
+                        WhenCreated = (Get-Date).AddHours(-2)
+                        WhenCreatedUtc = (Get-Date).AddHours(-2)
+                    })
+                }
+                return $null
             } -ModuleName Office365MailAliases
             Mock Set-DistributionGroup { } -ModuleName Office365MailAliases
             Mock Disconnect-ExchangeOnline { } -ModuleName Office365MailAliases
@@ -252,6 +274,7 @@ Describe 'Select-MailAlias' {
 
     Context 'Edge Cases' {
         It 'Should throw error when no claimable aliases are found' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
@@ -262,11 +285,15 @@ Describe 'Select-MailAlias' {
         }
 
         It 'Should warn when alias is less than 60 minutes old' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                param($Identity)
-                if ($null -eq $Identity) {
+                param($Filter)
+                if ($Filter -match 'NewDomain.com') {
+                    return $null
+                }
+                if ($Filter -match '_CLAIMABLE') {
                     return @([PSCustomObject]@{
                         Name = 'TEST12345'
                         DisplayName = 'TEST12345_CLAIMABLE'
@@ -304,6 +331,7 @@ Describe 'Get-UsedMailAlias' {
 
     Context 'Typical Usage' {
         BeforeEach {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
@@ -345,6 +373,9 @@ Describe 'Get-UsedMailAlias' {
         }
 
         It 'Should disconnect from Exchange Online when KeepAlive is not specified' {
+            Mock Get-ConnectionInformation {
+                return [PSCustomObject]@{ State = 'Connected' }
+            } -ModuleName Office365MailAliases
             Mock Get-PSSession {
                 return @([PSCustomObject]@{ ComputerName = 'outlook.office365.com'; State = 'Opened' })
             } -ModuleName Office365MailAliases
@@ -357,6 +388,7 @@ Describe 'Get-UsedMailAlias' {
 
     Context 'Edge Cases' {
         It 'Should return nothing when no used aliases exist' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup { return $null } -ModuleName Office365MailAliases
@@ -382,6 +414,7 @@ Describe 'Get-UnusedMailAlias' {
 
     Context 'Typical Usage' {
         BeforeEach {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
@@ -423,6 +456,9 @@ Describe 'Get-UnusedMailAlias' {
         }
 
         It 'Should disconnect from Exchange Online when KeepAlive is not specified' {
+            Mock Get-ConnectionInformation {
+                return [PSCustomObject]@{ State = 'Connected' }
+            } -ModuleName Office365MailAliases
             Mock Get-PSSession {
                 return @([PSCustomObject]@{ ComputerName = 'outlook.office365.com'; State = 'Opened' })
             } -ModuleName Office365MailAliases
@@ -435,6 +471,7 @@ Describe 'Get-UnusedMailAlias' {
 
     Context 'Edge Cases' {
         It 'Should return nothing when no unused aliases exist' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup { return $null } -ModuleName Office365MailAliases
@@ -460,18 +497,19 @@ Describe 'Set-MailAliasToArchived' {
 
     Context 'Typical Usage' {
         BeforeEach {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup {
-                param($Identity)
-                if ($null -eq $Identity) {
+                param($Filter, $Identity)
+                if ($null -ne $Filter) {
                     return @([PSCustomObject]@{
                         Identity = 'TEST12345'
                         Name = 'TEST12345'
                         DisplayName = 'Google.com - contoso.com'
                         PrimarySmtpAddress = 'TEST12345@contoso.com'
                     })
-                } else {
+                } elseif ($null -ne $Identity) {
                     return [PSCustomObject]@{
                         Identity = $Identity
                         Name = 'TEST12345'
@@ -479,6 +517,10 @@ Describe 'Set-MailAliasToArchived' {
                         PrimarySmtpAddress = 'TEST12345@contoso.com'
                     }
                 }
+                return $null
+            } -ModuleName Office365MailAliases
+            Mock Get-DistributionGroupMember {
+                return @([PSCustomObject]@{ Identity = 'admin@contoso.com' })
             } -ModuleName Office365MailAliases
             Mock Set-DistributionGroup { } -ModuleName Office365MailAliases
             Mock Remove-DistributionGroupMember { } -ModuleName Office365MailAliases
@@ -510,6 +552,9 @@ Describe 'Set-MailAliasToArchived' {
         }
 
         It 'Should disconnect from Exchange Online when KeepAlive is not specified' {
+            Mock Get-ConnectionInformation {
+                return [PSCustomObject]@{ State = 'Connected' }
+            } -ModuleName Office365MailAliases
             Mock Get-PSSession {
                 return @([PSCustomObject]@{ ComputerName = 'outlook.office365.com'; State = 'Opened' })
             } -ModuleName Office365MailAliases
@@ -528,6 +573,7 @@ Describe 'Set-MailAliasToArchived' {
 
     Context 'Error Cases' {
         It 'Should throw error when domain name does not exist' {
+            Mock Get-ConnectionInformation { return $null } -ModuleName Office365MailAliases
             Mock Get-PSSession { return @() } -ModuleName Office365MailAliases
             Mock Connect-ExchangeOnline { } -ModuleName Office365MailAliases
             Mock Get-DistributionGroup { return $null } -ModuleName Office365MailAliases
