@@ -45,7 +45,7 @@ jobs:
       # Checkout the code base #
       ##########################
       - name: Checkout Code
-        uses: actions/checkout@v6
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       ################################
       # Install Pester module        #
@@ -75,7 +75,7 @@ jobs:
       # Upload test results          #
       ################################
       - name: Upload Test Results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
           name: test-results
@@ -86,7 +86,7 @@ jobs:
       # Publish Test Results         #
       ################################
       - name: Publish Test Results
-        uses: EnricoMi/publish-unit-test-result-action/windows@v2
+        uses: EnricoMi/publish-unit-test-result-action/windows@c950f6fb443cb5af20a377fd0dfaa78838901040 # v2
         if: always()
         with:
           files: test-results.xml
